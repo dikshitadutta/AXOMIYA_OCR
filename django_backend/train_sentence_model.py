@@ -174,6 +174,23 @@ def parse_args():
         help="Path for final checkpoint",
     )
     parser.add_argument(
+        "--latest-checkpoint",
+        type=str,
+        default="checkpoints/latest_model_sentences.pth",
+        help="Path for latest epoch checkpoint",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint if available",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint path to resume from (overrides --latest-checkpoint)",
+    )
+    parser.add_argument(
         "--plot-out",
         type=str,
         default="training_curve_sentences.png",
@@ -186,6 +203,19 @@ def ensure_parent_dir(path_str):
     path = Path(path_str)
     if path.parent and str(path.parent) != ".":
         path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, device=None):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        return checkpoint
+    model.load_state_dict(checkpoint)
+    return {"epoch": -1}
 
 
 def train(args):
@@ -278,6 +308,33 @@ def train(args):
         factor=args.scheduler_factor,
     )
 
+    start_epoch = 0
+    best_val_loss = float("inf")
+    best_cer = float("inf")
+    no_improve_epochs = 0
+
+    if args.resume:
+        resume_path = args.resume_checkpoint or args.latest_checkpoint
+        if resume_path and os.path.exists(resume_path):
+            print(f"Resuming from checkpoint: {resume_path}")
+            checkpoint = load_checkpoint(
+                resume_path,
+                model,
+                optimizer,
+                scheduler,
+                device,
+            )
+            if checkpoint is not None and isinstance(checkpoint, dict):
+                start_epoch = checkpoint.get("epoch", -1) + 1
+                best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
+                best_cer = checkpoint.get("best_cer", best_cer)
+                no_improve_epochs = checkpoint.get("no_improve_epochs", no_improve_epochs)
+                print(f"Resuming training at epoch {start_epoch + 1}")
+            else:
+                print("Loaded model weights only; starting from epoch 1.")
+        else:
+            print(f"Resume requested but checkpoint not found: {resume_path}")
+
     print("\n" + "=" * 60)
     print("Sentence OCR training")
     print("=" * 60)
@@ -307,63 +364,20 @@ def train(args):
 
     ensure_parent_dir(args.best_checkpoint)
     ensure_parent_dir(args.final_checkpoint)
+    ensure_parent_dir(args.latest_checkpoint)
     ensure_parent_dir(args.plot_out)
 
     print("\nStarting training...\n")
 
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0.0
-        batch_count = 0
-        epoch_start = time.time()
+    epoch = start_epoch - 1
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            model.train()
+            total_loss = 0.0
+            batch_count = 0
+            epoch_start = time.time()
 
-        for batch_idx, batch in enumerate(train_loader):
-            if batch is None:
-                continue
-
-            images, labels, input_lengths, target_lengths = batch
-            images = images.to(device)
-            labels = labels.to(device)
-            input_lengths = input_lengths.to(device)
-            target_lengths = target_lengths.to(device)
-
-            outputs = model(images)
-            outputs = torch.log_softmax(outputs, 2)
-            loss = criterion(outputs, labels, input_lengths, target_lengths)
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-
-            total_loss += loss.item()
-            batch_count += 1
-
-            if batch_idx % 50 == 0:
-                elapsed = time.time() - epoch_start
-                batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
-                eta = (
-                    (len(train_loader) - batch_idx) / batches_per_sec
-                    if batches_per_sec > 0
-                    else 0
-                )
-                print(
-                    f"Epoch {epoch + 1}/{args.epochs} | "
-                    f"Batch {batch_idx}/{len(train_loader)} | "
-                    f"Loss: {loss.item():.4f} | "
-                    f"Speed: {batches_per_sec:.2f} batch/s | ETA: {eta:.0f}s"
-                )
-
-        avg_train_loss = total_loss / batch_count if batch_count > 0 else 0.0
-        train_losses.append(avg_train_loss)
-
-        model.eval()
-        val_loss = 0.0
-        val_batch_count = 0
-        val_metrics = OCRMetrics()
-
-        with torch.no_grad():
-            for batch in val_loader:
+            for batch_idx, batch in enumerate(train_loader):
                 if batch is None:
                     continue
 
@@ -377,47 +391,124 @@ def train(args):
                 outputs = torch.log_softmax(outputs, 2)
                 loss = criterion(outputs, labels, input_lengths, target_lengths)
 
-                val_loss += loss.item()
-                val_batch_count += 1
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                optimizer.step()
 
-                # Decode predictions and compute CER / WER
-                predictions, targets = decode_ctc_greedy(
-                    outputs, input_lengths, labels, target_lengths
-                )
-                val_metrics.update(predictions, targets)
+                total_loss += loss.item()
+                batch_count += 1
 
-        avg_val_loss = val_loss / val_batch_count if val_batch_count > 0 else 0.0
-        val_losses.append(avg_val_loss)
-        val_cers.append(val_metrics.cer)
-        val_wers.append(val_metrics.wer)
-        epoch_time = time.time() - epoch_start
+                if batch_idx % 50 == 0:
+                    elapsed = time.time() - epoch_start
+                    batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                    eta = (
+                        (len(train_loader) - batch_idx) / batches_per_sec
+                        if batches_per_sec > 0
+                        else 0
+                    )
+                    print(
+                        f"Epoch {epoch + 1}/{args.epochs} | "
+                        f"Batch {batch_idx}/{len(train_loader)} | "
+                        f"Loss: {loss.item():.4f} | "
+                        f"Speed: {batches_per_sec:.2f} batch/s | ETA: {eta:.0f}s"
+                    )
 
-        print(f"\n{'=' * 60}")
-        print(
-            f"Epoch {epoch + 1}/{args.epochs} completed in {epoch_time:.1f}s "
-            f"({epoch_time / 60:.1f} min)"
+            avg_train_loss = total_loss / batch_count if batch_count > 0 else 0.0
+            train_losses.append(avg_train_loss)
+
+            model.eval()
+            val_loss = 0.0
+            val_batch_count = 0
+            val_metrics = OCRMetrics()
+
+            with torch.no_grad():
+                for batch in val_loader:
+                    if batch is None:
+                        continue
+
+                    images, labels, input_lengths, target_lengths = batch
+                    images = images.to(device)
+                    labels = labels.to(device)
+                    input_lengths = input_lengths.to(device)
+                    target_lengths = target_lengths.to(device)
+
+                    outputs = model(images)
+                    outputs = torch.log_softmax(outputs, 2)
+                    loss = criterion(outputs, labels, input_lengths, target_lengths)
+
+                    val_loss += loss.item()
+                    val_batch_count += 1
+
+                    # Decode predictions and compute CER / WER
+                    predictions, targets = decode_ctc_greedy(
+                        outputs, input_lengths, labels, target_lengths
+                    )
+                    val_metrics.update(predictions, targets)
+
+            avg_val_loss = val_loss / val_batch_count if val_batch_count > 0 else 0.0
+            val_losses.append(avg_val_loss)
+            val_cers.append(val_metrics.cer)
+            val_wers.append(val_metrics.wer)
+            epoch_time = time.time() - epoch_start
+
+            print(f"\n{'=' * 60}")
+            print(
+                f"Epoch {epoch + 1}/{args.epochs} completed in {epoch_time:.1f}s "
+                f"({epoch_time / 60:.1f} min)"
+            )
+            print(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            print(f"Val {val_metrics.summary()}")
+            print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_cer = val_metrics.cer
+                torch.save(model.state_dict(), args.best_checkpoint)
+                print(f"Best model saved to: {args.best_checkpoint}")
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+                print(f"No improvement for {no_improve_epochs} epoch(s)")
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_cer": best_cer,
+                    "no_improve_epochs": no_improve_epochs,
+                },
+                args.latest_checkpoint,
+            )
+            print(f"Latest checkpoint saved to: {args.latest_checkpoint}")
+
+            print(f"{'=' * 60}\n")
+
+            scheduler.step(avg_val_loss)
+
+            if no_improve_epochs >= args.early_stop_patience:
+                print(f"Early stopping after {epoch + 1} epochs")
+                break
+
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt detected. Saving latest checkpoint before exit...")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_val_loss": best_val_loss,
+                "best_cer": best_cer,
+                "no_improve_epochs": no_improve_epochs,
+            },
+            args.latest_checkpoint,
         )
-        print(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        print(f"Val {val_metrics.summary()}")
-        print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
-
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_cer = val_metrics.cer
-            torch.save(model.state_dict(), args.best_checkpoint)
-            print(f"Best model saved to: {args.best_checkpoint}")
-            no_improve_epochs = 0
-        else:
-            no_improve_epochs += 1
-            print(f"No improvement for {no_improve_epochs} epoch(s)")
-
-        print(f"{'=' * 60}\n")
-
-        scheduler.step(avg_val_loss)
-
-        if no_improve_epochs >= args.early_stop_patience:
-            print(f"Early stopping after {epoch + 1} epochs")
-            break
+        print(f"Latest checkpoint saved to: {args.latest_checkpoint}")
+        return
 
     torch.save(model.state_dict(), args.final_checkpoint)
 

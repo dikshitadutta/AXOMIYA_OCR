@@ -71,7 +71,11 @@ def decode_prediction(preds, pred_sizes):
 
 def load_model(checkpoint_path, device):
     model = AssameseOCR(img_height=64, nn_classes=len(char_to_idx) + 1)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()
     return model
