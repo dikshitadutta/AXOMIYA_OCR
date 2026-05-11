@@ -312,6 +312,10 @@ def train(args):
     best_val_loss = float("inf")
     best_cer = float("inf")
     no_improve_epochs = 0
+    train_losses = []
+    val_losses = []
+    val_cers = []
+    val_wers = []
 
     if args.resume:
         resume_path = args.resume_checkpoint or args.latest_checkpoint
@@ -353,14 +357,6 @@ def train(args):
         print(f"Sample target lengths: {target_lengths[:4].tolist()}")
         space_idx = char_to_idx.get(" ", -1)
         print(f"Labels contain spaces: {space_idx > 0 and space_idx in labels}")
-
-    best_val_loss = float("inf")
-    best_cer = float("inf")
-    train_losses = []
-    val_losses = []
-    val_cers = []
-    val_wers = []
-    no_improve_epochs = 0
 
     ensure_parent_dir(args.best_checkpoint)
     ensure_parent_dir(args.final_checkpoint)
